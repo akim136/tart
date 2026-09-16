@@ -26,6 +26,9 @@ struct Prune: AsyncParsableCommand {
   @Flag(help: .hidden)
   var gc: Bool = false
 
+  @Flag(help: "Show entries that would be removed and their estimated allocated size without making changes.")
+  var dryRun: Bool = false
+
   mutating func validate() throws {
     // --cache-budget deprecation logic
     if let cacheBudget = cacheBudget {
@@ -44,7 +47,15 @@ struct Prune: AsyncParsableCommand {
   }
 
   func run() async throws {
-    if gc {
+    if dryRun {
+      print("Dry run: no changes will be made.")
+      if gc {
+        print("Skipping garbage collection (--gc) during dry run.")
+      }
+      if entries == "caches" {
+        print("Note: shared stacked-image content is not reattributed during preview; actual pruning may select different entries and reclaim a different amount of space.")
+      }
+    } else if gc {
       try VMStorageOCI().gc()
     }
 
@@ -53,37 +64,82 @@ struct Prune: AsyncParsableCommand {
 
     switch entries {
     case "caches":
-      prunableStorages = [try VMStorageOCI(), try IPSWCache()]
+      prunableStorages = [try VMStorageOCI(readOnly: dryRun), try IPSWCache(readOnly: dryRun)]
     case "vms":
-      prunableStorages = [try VMStorageLocal()]
+      prunableStorages = [try VMStorageLocal(readOnly: dryRun)]
     default:
       throw ValidationError("unsupported --entries value, please specify either \"caches\" or \"vms\"")
     }
+
+    let operation = PruningOperation(dryRun: dryRun)
 
     // Clean up cache entries based on last accessed date
     if let olderThan = olderThan {
       let olderThanInterval = Int(exactly: olderThan)!.days.timeInterval
       let olderThanDate = Date() - olderThanInterval
 
-      try Prune.pruneOlderThan(prunableStorages: prunableStorages, olderThanDate: olderThanDate)
+      try Prune.pruneOlderThan(prunableStorages: prunableStorages, olderThanDate: olderThanDate, operation: operation)
     }
 
     // Clean up cache entries based on imposed cache size limit and entry's last accessed date
     if let spaceBudget = spaceBudget {
-      try Prune.pruneSpaceBudget(prunableStorages: prunableStorages, spaceBudgetBytes: UInt64(spaceBudget) * 1024 * 1024 * 1024)
+      try Prune.pruneSpaceBudget(prunableStorages: prunableStorages, spaceBudgetBytes: UInt64(spaceBudget) * 1024 * 1024 * 1024, operation: operation)
+    }
+
+    if dryRun {
+      for entry in operation.entries {
+        let size = ByteCountFormatter.string(fromByteCount: entry.allocatedSizeBytes, countStyle: .file)
+        print("Would remove \(entry.url.path) (\(size))")
+      }
+      if operation.entries.isEmpty {
+        print("No matching entries.")
+      }
+      let total = ByteCountFormatter.string(fromByteCount: operation.estimatedReclaimedBytes, countStyle: .file)
+      print("Total estimated space reclaimed: \(total) (allocated size).")
     }
   }
 
-  static func pruneOlderThan(prunableStorages: [PrunableStorage], olderThanDate: Date) throws {
-    let prunables: [Prunable] = try prunableStorages.flatMap { try $0.prunables() }
+  /// Shares selection between deletion and preview, including across criteria.
+  /// Only previews remember removals; real runs always observe the live storage.
+  final class PruningOperation {
+    let dryRun: Bool
+    private var removedURLs = Swift.Set<URL>()
+    private(set) var entries: [(url: URL, allocatedSizeBytes: Int64)] = []
+    private(set) var estimatedReclaimedBytes: Int64 = 0
 
-    try prunables.filter { try $0.accessDate() <= olderThanDate }.forEach { try $0.delete() }
+    init(dryRun: Bool = false) {
+      self.dryRun = dryRun
+    }
+
+    func includes(_ prunable: Prunable) -> Bool {
+      !dryRun || !removedURLs.contains(prunable.url)
+    }
+
+    func remove(_ prunable: Prunable) throws {
+      if dryRun {
+        let size = Int64(try prunable.allocatedSizeBytes())
+        removedURLs.insert(prunable.url)
+        entries.append((prunable.url, size))
+        estimatedReclaimedBytes += size
+      } else {
+        try prunable.delete()
+      }
+    }
   }
 
-  static func pruneSpaceBudget(prunableStorages: [PrunableStorage], spaceBudgetBytes: UInt64) throws {
+  static func pruneOlderThan(prunableStorages: [PrunableStorage], olderThanDate: Date,
+                             operation: PruningOperation = PruningOperation()) throws {
+    let prunables: [Prunable] = try prunableStorages.flatMap { try $0.prunables() }.filter(operation.includes)
+
+    try prunables.filter { try $0.accessDate() <= olderThanDate }.forEach { try operation.remove($0) }
+  }
+
+  static func pruneSpaceBudget(prunableStorages: [PrunableStorage], spaceBudgetBytes: UInt64,
+                               operation: PruningOperation = PruningOperation()) throws {
     while true {
       let prunables: [Prunable] = try prunableStorages
         .flatMap { try $0.prunables() }
+        .filter(operation.includes)
         .sorted { try $0.accessDate() > $1.accessDate() }
 
       var remainingBudgetBytes = spaceBudgetBytes
@@ -107,7 +163,9 @@ struct Prune: AsyncParsableCommand {
 
       // Deleting one cached stacked image can change which remaining image
       // owns shared immutable content. Rebuild before choosing another.
-      try prunableToDelete.delete()
+      // Preview excludes simulated removals so this loop still makes progress,
+      // but cannot observe shared-content ownership changes without deletion.
+      try operation.remove(prunableToDelete)
     }
   }
 

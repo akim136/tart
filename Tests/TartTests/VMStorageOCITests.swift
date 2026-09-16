@@ -601,13 +601,32 @@ final class VMStorageOCITests: XCTestCase {
       )
       let olderRecord = try createRecord(for: firstManifest, in: storage)
       let newerRecord = try createRecord(for: secondManifest, in: storage)
-      try olderRecord.url.updateAccessDate(Date(timeIntervalSince1970: 1))
-      try newerRecord.url.updateAccessDate(Date(timeIntervalSince1970: 2))
+      // Keep directory enumeration from advancing the filesystem access times
+      // between preview and deletion while retaining a strict age ordering.
+      try olderRecord.url.updateAccessDate(Date().addingTimeInterval(3600))
+      try newerRecord.url.updateAccessDate(Date().addingTimeInterval(7200))
 
       let olderCandidate = try XCTUnwrap(storage.prunables().first {
         $0.url.lastPathComponent == olderRecord.url.lastPathComponent
       })
       let budget = UInt64(try olderCandidate.allocatedSizeBytes())
+
+      let preview = Prune.PruningOperation(dryRun: true)
+      try Prune.pruneSpaceBudget(
+        prunableStorages: [try VMStorageOCI(readOnly: true)],
+        spaceBudgetBytes: budget,
+        operation: preview
+      )
+      // Without deleting the owner, preview cannot reattribute the shared
+      // base to the older record. The CLI warns about this limitation.
+      XCTAssertEqual(preview.entries.map { $0.url.lastPathComponent }, [newerRecord.url.lastPathComponent])
+      let newerCandidate = try XCTUnwrap(storage.prunables().first {
+        $0.url.lastPathComponent == newerRecord.url.lastPathComponent
+      })
+      XCTAssertEqual(preview.estimatedReclaimedBytes, Int64(try newerCandidate.allocatedSizeBytes()))
+      XCTAssertTrue(FileManager.default.fileExists(atPath: olderRecord.url.path))
+      XCTAssertTrue(FileManager.default.fileExists(atPath: newerRecord.url.path))
+      XCTAssertTrue(FileManager.default.fileExists(atPath: baseContent.url.path))
 
       // On the first pass the newer record owns the shared base and is
       // selected for deletion, while the older record fits this budget.

@@ -4,9 +4,11 @@ import Retry
 
 class VMStorageOCI: PrunableStorage {
   let baseURL: URL
+  private let readOnly: Bool
 
-  init() throws {
-    baseURL = try Config().tartCacheDir.appendingPathComponent("OCIs", isDirectory: true)
+  init(readOnly: Bool = false) throws {
+    self.readOnly = readOnly
+    baseURL = try Config(readOnly: readOnly).tartCacheDir.appendingPathComponent("OCIs", isDirectory: true)
   }
 
   private func vmURL(_ name: RemoteName) -> URL {
@@ -351,7 +353,7 @@ class VMStorageOCI: PrunableStorage {
       }
     }
 
-    let contentStore = try ContentStore()
+    let contentStore = try ContentStore(readOnly: readOnly)
     var ownedContentURLs = [URL: [URL]]()
     for (contentDigest, owner) in contentOwners {
       let contentURL = try contentStore.contentURL(for: contentDigest)
@@ -750,18 +752,28 @@ class VMStorageOCI: PrunableStorage {
   private func referencedContentDigests(includeCachedImages: Bool) throws -> Swift.Set<String> {
     var result = Swift.Set<String>()
 
-    for (_, vmDir) in try VMStorageLocal().list() where vmDir.isStackedVM {
+    for (_, vmDir) in try VMStorageLocal(readOnly: readOnly).list() where vmDir.isStackedVM {
       result.formUnion(try vmDir.diskContentDigests())
     }
 
     // Clone, pull, and import publish their manifest before installing
     // immutable content. Include partially populated temporary directories so
     // pruning cannot race those operations.
-    for url in try FileManager.default.contentsOfDirectory(
-      at: Config().tartTmpDir,
-      includingPropertiesForKeys: [],
-      options: .skipsHiddenFiles
-    ) {
+    let temporaryURLs: [URL]
+    do {
+      temporaryURLs = try FileManager.default.contentsOfDirectory(
+        at: Config(readOnly: readOnly).tartTmpDir,
+        includingPropertiesForKeys: [],
+        options: .skipsHiddenFiles
+      )
+    } catch {
+      if readOnly && error.isFileNotFound() {
+        temporaryURLs = []
+      } else {
+        throw error
+      }
+    }
+    for url in temporaryURLs {
       let vmDir = VMDirectory(baseURL: url)
       guard FileManager.default.fileExists(atPath: vmDir.manifestURL.path),
             let contentDigests = try? vmDir.diskContentDigests() else {
