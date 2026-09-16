@@ -92,9 +92,11 @@ struct Prune: AsyncParsableCommand {
       if gc {
         print("Garbage collection (--gc) is not included in this preview.")
       }
-      if spaceBudget != nil,
-         try prunableStorages.compactMap({ $0 as? VMStorageOCI }).contains(where: { try !$0.temporaryContentDigests().isEmpty }) {
-        print("Temporary image files still protect cached data in this preview. Cleanup before a real prune may remove those files, causing more images to exceed the space budget.")
+      // Not gated on --space-budget: Root's temporary-directory cleanup is
+      // skipped for every dry run, so an age-only preview can omit content
+      // that a real prune releases and then collects too.
+      if try prunableStorages.compactMap({ $0 as? VMStorageOCI }).contains(where: { try !$0.temporaryContentDigests().isEmpty }) {
+        print("Temporary image files still protect cached data in this preview. Cleanup before a real prune may release them, so a real run can remove more than is listed here.")
       }
     }
   }
@@ -113,10 +115,12 @@ struct Prune: AsyncParsableCommand {
 
     func remove(_ prunable: Prunable, allocatedSizeBytes: Int? = nil) throws {
       if dryRun {
+        // Only the per-entry size is recorded here. updateEstimate() is the
+        // sole writer of estimatedReclaimedBytes, since summing these would
+        // double-count content that merely changes owner.
         let size = Int64(try allocatedSizeBytes ?? prunable.allocatedSizeBytes())
         removedURLs.insert(prunable.url)
         entries.append((prunable.url, size))
-        estimatedReclaimedBytes += size
       } else {
         try prunable.delete()
       }
