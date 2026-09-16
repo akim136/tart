@@ -300,6 +300,11 @@ class VMStorageOCI: PrunableStorage {
         continue
       }
 
+      // Records are leaves in the cache namespace. Enumerating their contents
+      // advances the directory access time used by age/LRU pruning, so even a
+      // dry run would change subsequent selections. Only inspect known files.
+      enumerator.skipDescendants()
+
       // Split the relative VM's path at the last component
       // and figure out which character should be used
       // to join them together, either ":" for tags or

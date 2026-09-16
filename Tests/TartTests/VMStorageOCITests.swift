@@ -7,6 +7,90 @@ import XCTest
 #endif
 
 final class VMStorageOCITests: XCTestCase {
+  func testListPreservesRecordTimestamps() throws {
+    try withTemporaryTartHome {
+      let storage = try VMStorageOCI()
+      let record = try createRecord(for: stackedManifest(), in: storage)
+      try setAccessTime(record.url, seconds: 1_600_000_000)
+      let before = try timestamps(record.url)
+      XCTAssertTrue(record.isCachedImage)
+      XCTAssertEqual(try timestamps(record.url), before, "recognizing the record")
+      _ = try record.diskContentDigests()
+      XCTAssertEqual(try timestamps(record.url), before, "reading the manifest")
+      _ = try record.allocatedSizeBytes()
+      XCTAssertEqual(try timestamps(record.url), before, "sizing the record")
+
+      let standaloneName = try RemoteName("example.com:5000/org/deep/image@sha256:standalone")
+      let standalone = try storage.create(standaloneName)
+      try config().save(toURL: standalone.configURL)
+      try Data().write(to: standalone.nvramURL)
+      try Data("disk".utf8).write(to: standalone.diskURL)
+      let tagName = try RemoteName("example.com:5000/org/deep/image:latest")
+      // Create the tag directly: link() also runs GC, which is unrelated to listing.
+      try FileManager.default.createSymbolicLink(at: storage.baseURL.appendingRemoteName(tagName), withDestinationURL: standalone.url)
+      try setAccessTime(standalone.url, seconds: 1_600_003_600)
+      let standaloneBefore = try timestamps(standalone.url)
+
+      for readOnly in [false, true] {
+        let listed = try VMStorageOCI(readOnly: readOnly).list()
+        XCTAssertEqual(Swift.Set(listed.map { $0.0 }), [try digestName(for: stackedManifest()).description, standaloneName.description, tagName.description])
+        XCTAssertEqual(listed.filter { $0.2 }.map { $0.0 }, [tagName.description])
+        XCTAssertEqual(try timestamps(record.url), before, "VMStorageOCI.list()")
+        XCTAssertEqual(try timestamps(standalone.url), standaloneBefore, "VMStorageOCI.list()")
+      }
+    }
+  }
+
+  func testDryRunPreservesRecordTimestamps() async throws {
+    try await withTemporaryTartHome {
+      let storage = try VMStorageOCI()
+      let contentStore = try ContentStore()
+      let base = try installContent(Data("base".utf8), into: contentStore)
+      let overlay = try installContent(Data("overlay".utf8), into: contentStore)
+      let stacked = try createRecord(for: stackedManifest(
+        baseContentDigest: base.digest, overlayContentDigest: overlay.digest
+      ), in: storage)
+      let standalone = try createRecord(for: flatManifest(), in: storage)
+      try Data("disk".utf8).write(to: standalone.diskURL)
+      let records = [stacked, standalone]
+      for record in records {
+        try setAccessTime(record.url, seconds: 1_600_000_000)
+      }
+      let before = try records.map { try timestamps($0.url) }
+
+      // Repeat without resetting timestamps: every invocation must preserve them.
+      for _ in 0..<2 {
+        for criteria in [["--older-than", "7"], ["--space-budget", "0"], ["--older-than", "7", "--space-budget", "0", "--gc"]] {
+          let command = try Prune.parseAsRoot(criteria + ["--dry-run"]) as! Prune
+          Root.runGarbageCollection(for: command)
+          try await command.run()
+          XCTAssertEqual(try records.map { try timestamps($0.url) }, before, "criteria: \(criteria)")
+        }
+      }
+    }
+  }
+
+  func testFailedPreviewPreservesRecordTimestamps() throws {
+    try withTemporaryTartHome {
+      let storage = try VMStorageOCI()
+      let record = try createRecord(for: stackedManifest(), in: storage)
+      // A malformed local VM manifest makes the reference scan throw after list().
+      let local = try VMStorageLocal().create("broken")
+      try config().save(toURL: local.configURL)
+      try Data().write(to: local.nvramURL)
+      try Data().write(to: local.overlayURL)
+      try Data("{".utf8).write(to: local.manifestURL)
+      try setAccessTime(record.url, seconds: 1_600_000_000)
+      let before = try timestamps(record.url)
+
+      XCTAssertThrowsError(try Prune.pruneSpaceBudget(
+        prunableStorages: [try VMStorageOCI(readOnly: true)], spaceBudgetBytes: 0,
+        operation: Prune.PruningOperation(dryRun: true)
+      ))
+      XCTAssertEqual(try timestamps(record.url), before)
+    }
+  }
+
   func testPopulateStandalonePushedImageCachesDiskAndManifest() throws {
     try withTemporaryTartHome {
       let source = try standaloneSource(diskData: Data("disk".utf8))
@@ -620,10 +704,11 @@ final class VMStorageOCITests: XCTestCase {
       )
       let olderRecord = try createRecord(for: firstManifest, in: storage)
       let newerRecord = try createRecord(for: secondManifest, in: storage)
-      // Keep directory enumeration from advancing the filesystem access times
-      // between preview and deletion while retaining a strict age ordering.
-      try olderRecord.url.updateAccessDate(Date().addingTimeInterval(3600))
-      try newerRecord.url.updateAccessDate(Date().addingTimeInterval(7200))
+      // Past access times establish which record owns the shared base. Scans
+      // must preserve this ordering, including across preview and deletion.
+      try setAccessTime(olderRecord.url, seconds: 1_600_000_000)
+      try setAccessTime(newerRecord.url, seconds: 1_600_003_600)
+      let originalTimestamps = try [olderRecord, newerRecord].map { try timestamps($0.url) }
 
       let olderCandidate = try XCTUnwrap(storage.prunables().first {
         $0.url.lastPathComponent == olderRecord.url.lastPathComponent
@@ -636,6 +721,7 @@ final class VMStorageOCITests: XCTestCase {
         spaceBudgetBytes: budget,
         operation: preview
       )
+      XCTAssertEqual(try [olderRecord, newerRecord].map { try timestamps($0.url) }, originalTimestamps)
       // The preview must move ownership of the shared base to the older
       // record, selecting both records just like the real deletion below.
       XCTAssertEqual(preview.entries.map { $0.url.lastPathComponent }, [
@@ -678,14 +764,17 @@ final class VMStorageOCITests: XCTestCase {
       let newer = try createRecord(for: stackedManifest(
         baseContentDigest: base.digest, overlayContentDigest: secondOverlay.digest
       ), in: storage)
-      try older.url.updateAccessDate(Date().addingTimeInterval(3600))
-      try newer.url.updateAccessDate(Date().addingTimeInterval(7200))
+      // The newer record must initially own the shared base.
+      try setAccessTime(older.url, seconds: 1_600_000_000)
+      try setAccessTime(newer.url, seconds: 1_600_003_600)
+      let originalTimestamps = try [older, newer].map { try timestamps($0.url) }
 
       let previewStorage: PrunableStorage = try VMStorageOCI(readOnly: true)
       let newerCandidate = try XCTUnwrap(storage.prunables().first {
         $0.url.lastPathComponent == newer.url.lastPathComponent
       })
       let simulated = try previewStorage.prunables(simulatingRemovalOf: [newerCandidate.url])
+      XCTAssertEqual(try [older, newer].map { try timestamps($0.url) }, originalTimestamps)
       XCTAssertEqual(simulated.map { $0.url.lastPathComponent }, [older.url.lastPathComponent])
       let simulatedSize = try XCTUnwrap(simulated.first).allocatedSizeBytes()
       XCTAssertEqual(simulatedSize, try older.allocatedSizeBytes() + base.url.allocatedSizeBytes() + firstOverlay.url.allocatedSizeBytes())
@@ -716,9 +805,11 @@ final class VMStorageOCITests: XCTestCase {
       let newer = try createRecord(for: stackedManifest(
         baseContentDigest: base.digest, overlayContentDigest: secondOverlay.digest
       ), in: storage)
-      let cutoff = Date().addingTimeInterval(5400)
-      try older.url.updateAccessDate(cutoff.addingTimeInterval(-1800))
-      try newer.url.updateAccessDate(cutoff.addingTimeInterval(1800))
+      // Only the older record meets the age criterion; both dates are past.
+      let cutoff = Date(timeIntervalSince1970: 1_600_001_800)
+      try setAccessTime(older.url, seconds: 1_600_000_000)
+      try setAccessTime(newer.url, seconds: 1_600_003_600)
+      let originalTimestamps = try [older, newer].map { try timestamps($0.url) }
       let newerCandidate = try XCTUnwrap(storage.prunables().first {
         $0.url.lastPathComponent == newer.url.lastPathComponent
       })
@@ -730,6 +821,7 @@ final class VMStorageOCITests: XCTestCase {
       try Prune.pruneOlderThan(prunableStorages: [previewStorage], olderThanDate: cutoff, operation: preview)
       try Prune.pruneSpaceBudget(prunableStorages: [previewStorage], spaceBudgetBytes: budget, operation: preview)
 
+      XCTAssertEqual(try [older, newer].map { try timestamps($0.url) }, originalTimestamps)
       XCTAssertEqual(preview.entries.map { $0.url.lastPathComponent }, [older.url.lastPathComponent])
       XCTAssertEqual(preview.estimatedReclaimedBytes, Int64(reclaimedSize))
       XCTAssertTrue(FileManager.default.fileExists(atPath: older.url.path))
@@ -774,9 +866,11 @@ final class VMStorageOCITests: XCTestCase {
         baseUncompressedSize: UInt64(try retainedBase.url.sizeBytes()),
         overlayUncompressedSize: UInt64(try retainedOverlay.url.sizeBytes())
       ), in: storage)
-      try newest.url.updateAccessDate(Date().addingTimeInterval(10800))
-      try middle.url.updateAccessDate(Date().addingTimeInterval(7200))
-      try retained.url.updateAccessDate(Date().addingTimeInterval(3600))
+      // Fix the LRU order and shared-content owner using past access times.
+      try setAccessTime(newest.url, seconds: 1_600_007_200)
+      try setAccessTime(middle.url, seconds: 1_600_003_600)
+      try setAccessTime(retained.url, seconds: 1_600_000_000)
+      let originalTimestamps = try [newest, middle, retained].map { try timestamps($0.url) }
 
       let retainedCandidate = try XCTUnwrap(storage.prunables().first {
         $0.url.lastPathComponent == retained.url.lastPathComponent
@@ -787,6 +881,7 @@ final class VMStorageOCITests: XCTestCase {
       try Prune.pruneSpaceBudget(
         prunableStorages: [try VMStorageOCI(readOnly: true)], spaceBudgetBytes: budget, operation: preview
       )
+      XCTAssertEqual(try [newest, middle, retained].map { try timestamps($0.url) }, originalTimestamps)
       XCTAssertEqual(preview.entries.map { $0.url.lastPathComponent }, [newest.url.lastPathComponent, middle.url.lastPathComponent])
       XCTAssertEqual(preview.estimatedReclaimedBytes, initialSize - Int64(budget))
       XCTAssertTrue(FileManager.default.fileExists(atPath: newest.url.path))
@@ -899,6 +994,27 @@ final class VMStorageOCITests: XCTestCase {
       }
     }
   #endif
+
+  private func timestamps(_ url: URL) throws -> [Int] {
+    // Read the filesystem directly, avoiding URL resource-value caching and
+    // Date's loss of nanosecond precision. Include mtime/ctime to catch writes.
+    var info = stat()
+    guard stat(url.path, &info) == 0 else {
+      throw POSIXError(POSIXErrorCode(rawValue: errno)!)
+    }
+    return [info.st_atimespec.tv_sec, info.st_atimespec.tv_nsec,
+            info.st_mtimespec.tv_sec, info.st_mtimespec.tv_nsec,
+            info.st_ctimespec.tv_sec, info.st_ctimespec.tv_nsec]
+  }
+
+  private func setAccessTime(_ url: URL, seconds: Int) throws {
+    // Use subsecond precision and preserve mtime; updateAccessDate() does neither.
+    var info = stat()
+    guard stat(url.path, &info) == 0,
+          utimensat(AT_FDCWD, url.path, [timespec(tv_sec: seconds, tv_nsec: 123_456_789), info.st_mtimespec], 0) == 0 else {
+      throw POSIXError(POSIXErrorCode(rawValue: errno)!)
+    }
+  }
 
   private func standaloneSource(diskData: Data) throws -> VMDirectory {
     let vmDir = try temporaryVMDirectory()
