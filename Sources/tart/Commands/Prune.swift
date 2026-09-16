@@ -47,15 +47,7 @@ struct Prune: AsyncParsableCommand {
   }
 
   func run() async throws {
-    if dryRun {
-      print("Dry run: no changes will be made.")
-      if gc {
-        print("Skipping garbage collection (--gc) during dry run.")
-      }
-      if entries == "caches" {
-        print("Note: shared stacked-image content is not reattributed during preview; actual pruning may select different entries and reclaim a different amount of space.")
-      }
-    } else if gc {
+    if gc && !dryRun {
       try VMStorageOCI().gc()
     }
 
@@ -87,6 +79,7 @@ struct Prune: AsyncParsableCommand {
     }
 
     if dryRun {
+      print("Dry run: no changes will be made.")
       for entry in operation.entries {
         let size = ByteCountFormatter.string(fromByteCount: entry.allocatedSizeBytes, countStyle: .file)
         print("Would remove \(entry.url.path) (\(size))")
@@ -96,6 +89,13 @@ struct Prune: AsyncParsableCommand {
       }
       let total = ByteCountFormatter.string(fromByteCount: operation.estimatedReclaimedBytes, countStyle: .file)
       print("Total estimated space reclaimed: \(total) (allocated size).")
+      if gc {
+        print("Garbage collection (--gc) is not included in this preview.")
+      }
+      if spaceBudget != nil,
+         try prunableStorages.compactMap({ $0 as? VMStorageOCI }).contains(where: { try !$0.temporaryContentDigests().isEmpty }) {
+        print("Temporary image files still protect cached data in this preview. Cleanup before a real prune may remove those files, causing more images to exceed the space budget.")
+      }
     }
   }
 
@@ -103,7 +103,7 @@ struct Prune: AsyncParsableCommand {
   /// Only previews remember removals; real runs always observe the live storage.
   final class PruningOperation {
     let dryRun: Bool
-    private var removedURLs = Swift.Set<URL>()
+    private(set) var removedURLs = Swift.Set<URL>()
     private(set) var entries: [(url: URL, allocatedSizeBytes: Int64)] = []
     private(set) var estimatedReclaimedBytes: Int64 = 0
 
@@ -111,13 +111,9 @@ struct Prune: AsyncParsableCommand {
       self.dryRun = dryRun
     }
 
-    func includes(_ prunable: Prunable) -> Bool {
-      !dryRun || !removedURLs.contains(prunable.url)
-    }
-
-    func remove(_ prunable: Prunable) throws {
+    func remove(_ prunable: Prunable, allocatedSizeBytes: Int? = nil) throws {
       if dryRun {
-        let size = Int64(try prunable.allocatedSizeBytes())
+        let size = Int64(try allocatedSizeBytes ?? prunable.allocatedSizeBytes())
         removedURLs.insert(prunable.url)
         entries.append((prunable.url, size))
         estimatedReclaimedBytes += size
@@ -125,25 +121,55 @@ struct Prune: AsyncParsableCommand {
         try prunable.delete()
       }
     }
+
+    func allocatedSize(of prunables: [Prunable]) throws -> Int64? {
+      guard dryRun else {
+        return nil
+      }
+      return try prunables.reduce(0) { try $0 + Int64($1.allocatedSizeBytes()) }
+    }
+
+    func updateEstimate(from initialSize: Int64?, to prunables: [Prunable], previousEstimate: Int64) throws {
+      guard let initialSize, let remainingSize = try allocatedSize(of: prunables) else {
+        return
+      }
+      // Shared content can move between owners without being freed. Measure
+      // the change in total usage instead of summing successive ownerships.
+      estimatedReclaimedBytes = previousEstimate + initialSize - remainingSize
+    }
   }
 
   static func pruneOlderThan(prunableStorages: [PrunableStorage], olderThanDate: Date,
                              operation: PruningOperation = PruningOperation()) throws {
-    let prunables: [Prunable] = try prunableStorages.flatMap { try $0.prunables() }.filter(operation.includes)
+    let prunables: [Prunable] = try prunableStorages.flatMap { try $0.prunables(simulatingRemovalOf: operation.removedURLs) }
+    let matchingPrunables = try prunables.filter { try $0.accessDate() <= olderThanDate }
+    guard !matchingPrunables.isEmpty else {
+      return
+    }
+    let initialSize = try operation.allocatedSize(of: prunables)
+    let previousEstimate = operation.estimatedReclaimedBytes
 
-    try prunables.filter { try $0.accessDate() <= olderThanDate }.forEach { try operation.remove($0) }
+    try matchingPrunables.forEach { try operation.remove($0) }
+    if operation.dryRun {
+      let remaining = try prunableStorages.flatMap { try $0.prunables(simulatingRemovalOf: operation.removedURLs) }
+      try operation.updateEstimate(from: initialSize, to: remaining, previousEstimate: previousEstimate)
+    }
   }
 
   static func pruneSpaceBudget(prunableStorages: [PrunableStorage], spaceBudgetBytes: UInt64,
                                operation: PruningOperation = PruningOperation()) throws {
+    var initialSize: Int64?
+    let previousEstimate = operation.estimatedReclaimedBytes
     while true {
       let prunables: [Prunable] = try prunableStorages
-        .flatMap { try $0.prunables() }
-        .filter(operation.includes)
+        .flatMap { try $0.prunables(simulatingRemovalOf: operation.removedURLs) }
         .sorted { try $0.accessDate() > $1.accessDate() }
+      if initialSize == nil {
+        initialSize = try operation.allocatedSize(of: prunables)
+      }
 
       var remainingBudgetBytes = spaceBudgetBytes
-      var prunableToDelete: Prunable?
+      var prunableToDelete: (prunable: Prunable, allocatedSizeBytes: Int)?
 
       for prunable in prunables {
         let prunableSizeBytes = UInt64(try prunable.allocatedSizeBytes())
@@ -152,20 +178,19 @@ struct Prune: AsyncParsableCommand {
           // Don't mark for deletion as there is budget available
           remainingBudgetBytes -= prunableSizeBytes
         } else {
-          prunableToDelete = prunable
+          prunableToDelete = (prunable, Int(prunableSizeBytes))
           break
         }
       }
 
       guard let prunableToDelete else {
+        try operation.updateEstimate(from: initialSize, to: prunables, previousEstimate: previousEstimate)
         return
       }
 
       // Deleting one cached stacked image can change which remaining image
       // owns shared immutable content. Rebuild before choosing another.
-      // Preview excludes simulated removals so this loop still makes progress,
-      // but cannot observe shared-content ownership changes without deletion.
-      try operation.remove(prunableToDelete)
+      try operation.remove(prunableToDelete.prunable, allocatedSizeBytes: prunableToDelete.allocatedSizeBytes)
     }
   }
 

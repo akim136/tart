@@ -251,6 +251,25 @@ final class VMStorageOCITests: XCTestCase {
     }
   }
 
+  func testContentOnlyPreviewExcludesSimulatedRemovals() throws {
+    try withTemporaryTartHome {
+      let contentStore = try ContentStore()
+      let content = try installContent(Data("unreferenced".utf8), into: contentStore)
+      let storage: PrunableStorage = try VMStorageOCI(readOnly: true)
+      let candidate = try XCTUnwrap(storage.prunables().first)
+      XCTAssertTrue(try storage.prunables(simulatingRemovalOf: [candidate.url]).isEmpty)
+
+      let preview = Prune.PruningOperation(dryRun: true)
+      try Prune.pruneSpaceBudget(prunableStorages: [storage], spaceBudgetBytes: 0, operation: preview)
+      XCTAssertEqual(preview.entries.map(\.url), [candidate.url])
+      XCTAssertEqual(preview.estimatedReclaimedBytes, Int64(try content.url.allocatedSizeBytes()))
+      XCTAssertTrue(FileManager.default.fileExists(atPath: content.url.path))
+
+      try Prune.pruneSpaceBudget(prunableStorages: [try VMStorageOCI()], spaceBudgetBytes: 0)
+      XCTAssertFalse(FileManager.default.fileExists(atPath: content.url.path))
+    }
+  }
+
   func testGCDoesNotPruneContentReferencedByInProgressManifest() throws {
     try withTemporaryTartHome {
       let contentStore = try ContentStore()
@@ -617,13 +636,13 @@ final class VMStorageOCITests: XCTestCase {
         spaceBudgetBytes: budget,
         operation: preview
       )
-      // Without deleting the owner, preview cannot reattribute the shared
-      // base to the older record. The CLI warns about this limitation.
-      XCTAssertEqual(preview.entries.map { $0.url.lastPathComponent }, [newerRecord.url.lastPathComponent])
-      let newerCandidate = try XCTUnwrap(storage.prunables().first {
-        $0.url.lastPathComponent == newerRecord.url.lastPathComponent
-      })
-      XCTAssertEqual(preview.estimatedReclaimedBytes, Int64(try newerCandidate.allocatedSizeBytes()))
+      // The preview must move ownership of the shared base to the older
+      // record, selecting both records just like the real deletion below.
+      XCTAssertEqual(preview.entries.map { $0.url.lastPathComponent }, [
+        newerRecord.url.lastPathComponent, olderRecord.url.lastPathComponent,
+      ])
+      let initialSize = try storage.prunables().reduce(0) { try $0 + Int64($1.allocatedSizeBytes()) }
+      XCTAssertEqual(preview.estimatedReclaimedBytes, initialSize)
       XCTAssertTrue(FileManager.default.fileExists(atPath: olderRecord.url.path))
       XCTAssertTrue(FileManager.default.fileExists(atPath: newerRecord.url.path))
       XCTAssertTrue(FileManager.default.fileExists(atPath: baseContent.url.path))
@@ -642,6 +661,88 @@ final class VMStorageOCITests: XCTestCase {
       XCTAssertFalse(FileManager.default.fileExists(atPath: baseContent.url.path))
       XCTAssertFalse(FileManager.default.fileExists(atPath: firstOverlay.url.path))
       XCTAssertFalse(FileManager.default.fileExists(atPath: secondOverlay.url.path))
+    }
+  }
+
+  func testSimulatedRecordRemovalMatchesDeletionAndContentGC() throws {
+    try withTemporaryTartHome {
+      let contentStore = try ContentStore()
+      let base = try installContent(Data("shared-base".utf8), into: contentStore)
+      let firstOverlay = try installContent(Data("first-overlay".utf8), into: contentStore)
+      let secondOverlay = try installContent(Data("second-overlay".utf8), into: contentStore)
+      let orphan = try installContent(Data("orphan".utf8), into: contentStore)
+      let storage = try VMStorageOCI()
+      let older = try createRecord(for: stackedManifest(
+        baseContentDigest: base.digest, overlayContentDigest: firstOverlay.digest
+      ), in: storage)
+      let newer = try createRecord(for: stackedManifest(
+        baseContentDigest: base.digest, overlayContentDigest: secondOverlay.digest
+      ), in: storage)
+      try older.url.updateAccessDate(Date().addingTimeInterval(3600))
+      try newer.url.updateAccessDate(Date().addingTimeInterval(7200))
+
+      let previewStorage: PrunableStorage = try VMStorageOCI(readOnly: true)
+      let newerCandidate = try XCTUnwrap(storage.prunables().first {
+        $0.url.lastPathComponent == newer.url.lastPathComponent
+      })
+      let simulated = try previewStorage.prunables(simulatingRemovalOf: [newerCandidate.url])
+      XCTAssertEqual(simulated.map { $0.url.lastPathComponent }, [older.url.lastPathComponent])
+      let simulatedSize = try XCTUnwrap(simulated.first).allocatedSizeBytes()
+      XCTAssertEqual(simulatedSize, try older.allocatedSizeBytes() + base.url.allocatedSizeBytes() + firstOverlay.url.allocatedSizeBytes())
+      for url in [older.url, newer.url, base.url, firstOverlay.url, secondOverlay.url, orphan.url] {
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+      }
+
+      try newerCandidate.delete()
+      let remaining = try storage.prunables()
+      XCTAssertEqual(remaining.map(\.url), simulated.map(\.url))
+      XCTAssertEqual(try XCTUnwrap(remaining.first).allocatedSizeBytes(), simulatedSize)
+      XCTAssertFalse(FileManager.default.fileExists(atPath: secondOverlay.url.path))
+      XCTAssertFalse(FileManager.default.fileExists(atPath: orphan.url.path))
+      XCTAssertTrue(FileManager.default.fileExists(atPath: base.url.path))
+    }
+  }
+
+  func testAgeThenBudgetPreviewMatchesContentGC() throws {
+    try withTemporaryTartHome {
+      let contentStore = try ContentStore()
+      let base = try installContent(Data("shared-base".utf8), into: contentStore)
+      let firstOverlay = try installContent(Data("first-overlay".utf8), into: contentStore)
+      let secondOverlay = try installContent(Data("second-overlay".utf8), into: contentStore)
+      let storage = try VMStorageOCI()
+      let older = try createRecord(for: stackedManifest(
+        baseContentDigest: base.digest, overlayContentDigest: firstOverlay.digest
+      ), in: storage)
+      let newer = try createRecord(for: stackedManifest(
+        baseContentDigest: base.digest, overlayContentDigest: secondOverlay.digest
+      ), in: storage)
+      let cutoff = Date().addingTimeInterval(5400)
+      try older.url.updateAccessDate(cutoff.addingTimeInterval(-1800))
+      try newer.url.updateAccessDate(cutoff.addingTimeInterval(1800))
+      let newerCandidate = try XCTUnwrap(storage.prunables().first {
+        $0.url.lastPathComponent == newer.url.lastPathComponent
+      })
+      let budget = UInt64(try newerCandidate.allocatedSizeBytes())
+      let reclaimedSize = try older.allocatedSizeBytes() + firstOverlay.url.allocatedSizeBytes()
+      let preview = Prune.PruningOperation(dryRun: true)
+      let previewStorage = try VMStorageOCI(readOnly: true)
+
+      try Prune.pruneOlderThan(prunableStorages: [previewStorage], olderThanDate: cutoff, operation: preview)
+      try Prune.pruneSpaceBudget(prunableStorages: [previewStorage], spaceBudgetBytes: budget, operation: preview)
+
+      XCTAssertEqual(preview.entries.map { $0.url.lastPathComponent }, [older.url.lastPathComponent])
+      XCTAssertEqual(preview.estimatedReclaimedBytes, Int64(reclaimedSize))
+      XCTAssertTrue(FileManager.default.fileExists(atPath: older.url.path))
+      XCTAssertTrue(FileManager.default.fileExists(atPath: firstOverlay.url.path))
+
+      try Prune.pruneOlderThan(prunableStorages: [storage], olderThanDate: cutoff)
+      try Prune.pruneSpaceBudget(prunableStorages: [storage], spaceBudgetBytes: budget)
+
+      XCTAssertFalse(FileManager.default.fileExists(atPath: older.url.path))
+      XCTAssertFalse(FileManager.default.fileExists(atPath: firstOverlay.url.path))
+      XCTAssertTrue(FileManager.default.fileExists(atPath: newer.url.path))
+      XCTAssertTrue(FileManager.default.fileExists(atPath: base.url.path))
+      XCTAssertTrue(FileManager.default.fileExists(atPath: secondOverlay.url.path))
     }
   }
 
@@ -673,13 +774,23 @@ final class VMStorageOCITests: XCTestCase {
         baseUncompressedSize: UInt64(try retainedBase.url.sizeBytes()),
         overlayUncompressedSize: UInt64(try retainedOverlay.url.sizeBytes())
       ), in: storage)
-      try newest.url.updateAccessDate(Date(timeIntervalSince1970: 3))
-      try middle.url.updateAccessDate(Date(timeIntervalSince1970: 2))
-      try retained.url.updateAccessDate(Date(timeIntervalSince1970: 1))
+      try newest.url.updateAccessDate(Date().addingTimeInterval(10800))
+      try middle.url.updateAccessDate(Date().addingTimeInterval(7200))
+      try retained.url.updateAccessDate(Date().addingTimeInterval(3600))
 
       let retainedCandidate = try XCTUnwrap(storage.prunables().first {
         $0.url.lastPathComponent == retained.url.lastPathComponent
       })
+      let budget = UInt64(try retainedCandidate.allocatedSizeBytes())
+      let initialSize = try storage.prunables().reduce(0) { try $0 + Int64($1.allocatedSizeBytes()) }
+      let preview = Prune.PruningOperation(dryRun: true)
+      try Prune.pruneSpaceBudget(
+        prunableStorages: [try VMStorageOCI(readOnly: true)], spaceBudgetBytes: budget, operation: preview
+      )
+      XCTAssertEqual(preview.entries.map { $0.url.lastPathComponent }, [newest.url.lastPathComponent, middle.url.lastPathComponent])
+      XCTAssertEqual(preview.estimatedReclaimedBytes, initialSize - Int64(budget))
+      XCTAssertTrue(FileManager.default.fileExists(atPath: newest.url.path))
+      XCTAssertTrue(FileManager.default.fileExists(atPath: middle.url.path))
 
       // Initially the newest record owns the shared base and is too large.
       // The middle record appears small enough to retain, making the oldest
@@ -688,7 +799,7 @@ final class VMStorageOCITests: XCTestCase {
       // before selecting again must delete it and preserve the unrelated one.
       try Prune.pruneSpaceBudget(
         prunableStorages: [storage],
-        spaceBudgetBytes: UInt64(try retainedCandidate.allocatedSizeBytes())
+        spaceBudgetBytes: budget
       )
 
       XCTAssertFalse(FileManager.default.fileExists(atPath: newest.url.path))

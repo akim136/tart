@@ -111,14 +111,59 @@ final class PruneTests: XCTestCase {
     XCTAssertEqual(storage.scans, 1)
   }
 
+  func testSpaceBudgetPreviewReusesSelectedSizes() throws {
+    let storage = MockStorage()
+    let preview = Prune.PruningOperation(dryRun: true)
+    try Prune.pruneSpaceBudget(prunableStorages: [storage], spaceBudgetBytes: 0, operation: preview)
+
+    // One read for the initial total and one for selection, with no extra
+    // read when recording the selected entry. The final storage is empty.
+    XCTAssertEqual(storage.entries.map(\.sizeReads), [2, 2, 2])
+    XCTAssertEqual(preview.estimatedReclaimedBytes, 16)
+  }
+
   func testDryRunDoesNotCreateMissingHomeOrStorageDirectories() async throws {
     try await withTemporaryTartHome { home in
       for entries in ["caches", "vms"] {
         let command = try Prune.parseAsRoot(["--entries", entries, "--space-budget", "0", "--dry-run"]) as! Prune
         Root.runGarbageCollection(for: command)
-        try await command.run()
+        let output = try await captureStandardOutput { try await command.run() }
+        XCTAssertTrue(output.contains("No matching entries."))
+        XCTAssertFalse(output.contains("Note:"))
+        XCTAssertFalse(output.contains("Garbage collection"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: home.path))
       }
+    }
+  }
+
+  func testBudgetPreviewReportsTemporaryReferencesAfterResults() async throws {
+    try await withTemporaryTartHome { _ in
+      let contentStore = try ContentStore()
+      let data = Data("temporary-base".utf8)
+      let digest = Digest.hash(data)
+      let temporaryContent = try contentStore.temporaryContentURL(for: digest)
+      try data.write(to: temporaryContent)
+      let contentURL = try contentStore.install(temporaryContent, contentDigest: digest)
+      let temporaryVM = try VMDirectory.temporary()
+      var disk = OCIManifestLayer(
+        mediaType: diskV2MediaType, size: data.count, digest: "sha256:transport",
+        uncompressedSize: UInt64(data.count), uncompressedContentDigest: digest
+      )
+      disk.annotations?[diskFileContentDigestAnnotation] = digest
+      let manifest = OCIManifest(config: OCIManifestConfig(size: 1, digest: "sha256:config"), layers: [
+        OCIManifestLayer(mediaType: configMediaType, size: 1, digest: "sha256:config"),
+        disk,
+        OCIManifestLayer(mediaType: nvramMediaType, size: 1, digest: "sha256:nvram"),
+      ])
+      try manifest.toJSON().write(to: temporaryVM.manifestURL)
+
+      let command = try Prune.parseAsRoot(["--space-budget", "0", "--dry-run"]) as! Prune
+      let output = try await captureStandardOutput { try await command.run() }
+      let result = try XCTUnwrap(output.range(of: "No matching entries."))
+      let notice = try XCTUnwrap(output.range(of: "Temporary image files still protect cached data"))
+      XCTAssertLessThan(result.lowerBound, notice.lowerBound)
+      XCTAssertTrue(FileManager.default.fileExists(atPath: temporaryVM.manifestURL.path))
+      XCTAssertTrue(FileManager.default.fileExists(atPath: contentURL.path))
     }
   }
 
@@ -141,7 +186,15 @@ final class PruneTests: XCTestCase {
         try ipswURL.updateAccessDate(originalAccessDate)
         let command = try Prune.parseAsRoot(criteria + ["--dry-run"]) as! Prune
         Root.runGarbageCollection(for: command)
-        try await command.run()
+        let output = try await captureStandardOutput { try await command.run() }
+        XCTAssertFalse(output.contains("reattributed"))
+        XCTAssertTrue(output.hasSuffix("Garbage collection (--gc) is not included in this preview.\n"))
+        if criteria.count == 1 {
+          XCTAssertTrue(output.contains("No matching entries."))
+        } else {
+          let candidate = try XCTUnwrap(cache.prunables().first)
+          XCTAssertTrue(output.contains("Would remove \(candidate.url.path)"), output)
+        }
 
         XCTAssertEqual(try FileManager.default.subpathsOfDirectory(atPath: home.path).sorted(), originalPaths)
         ipswURL.removeCachedResourceValue(forKey: .contentAccessDateKey)
@@ -158,6 +211,24 @@ final class PruneTests: XCTestCase {
       try await command.run()
       XCTAssertFalse(FileManager.default.fileExists(atPath: ipswURL.path))
     }
+  }
+
+  private func captureStandardOutput(_ body: () async throws -> Void) async throws -> String {
+    let pipe = Pipe()
+    fflush(stdout)
+    let savedOutput = dup(STDOUT_FILENO)
+    defer {
+      fflush(stdout)
+      dup2(savedOutput, STDOUT_FILENO)
+      close(savedOutput)
+    }
+    dup2(pipe.fileHandleForWriting.fileDescriptor, STDOUT_FILENO)
+    try await body()
+    fflush(stdout)
+    dup2(savedOutput, STDOUT_FILENO)
+    try pipe.fileHandleForWriting.close()
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    return String(decoding: data, as: UTF8.self)
   }
 
   private func withTemporaryTartHome(_ body: (URL) async throws -> Void) async throws {
@@ -219,6 +290,7 @@ private final class MockPrunable: Prunable {
   let allocatedBytes: Int
   var deleted = false
   var sizeFails = false
+  var sizeReads = 0
   var deleteFails = false
   var onDelete: ((URL) -> Void)?
 
@@ -245,6 +317,7 @@ private final class MockPrunable: Prunable {
   }
 
   func allocatedSizeBytes() throws -> Int {
+    sizeReads += 1
     if sizeFails {
       throw MockPruneError.size
     }
